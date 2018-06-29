@@ -1,0 +1,164 @@
+---
+- name: Cetus Install - get facts
+  setup:
+
+- name: Cetus Install - install plugins
+  yum: pkg={{ item }} state=present
+  with_items:
+    - cmake
+    - gcc
+    - glib2-devel
+    - flex
+    - libevent-devel
+
+- name: Cetus Install - create cetus directories
+  file: path={{ item }} state=directory mode=0755
+  with_items:
+    - /tmp/cetus/build
+    - /tmp/libunwind
+    - /tmp/gperftools
+
+- name: Cetus Install - git clone libunwind
+  git:
+    repo: https://github.com/dropbox/libunwind.git
+    dest: "{{ downloads_dir }}/libunwind"
+    archive: "{{ downloads_dir }}/libunwind.zip"
+  delegate_facts: True
+  delegate_to: localhost
+  run_once: true
+  vars:
+    - ansible_become: false
+
+- name: Cetus Install - git clone gperftools
+  git:
+    repo: https://github.com/gperftools/gperftools.git
+    dest: "{{ downloads_dir }}/gperftools"
+    archive: "{{ downloads_dir }}/gperftools.zip"
+  delegate_facts: True
+  delegate_to: localhost
+  run_once: true
+  vars:
+    - ansible_become: false
+
+- name: Cetus Install - git clone cetus
+  git:
+    repo: https://github.com/Lede-Inc/cetus.git
+    dest: "{{ downloads_dir }}/cetus"
+    archive: "{{ downloads_dir }}/cetus.zip"
+  delegate_facts: True
+  delegate_to: localhost
+  run_once: true
+  vars:
+    - ansible_become: false
+
+- name: Cetus Install - put libunwind code to destination
+  unarchive:
+    src: "{{ downloads_dir }}/{{ item }}.zip"
+    dest: /tmp/{{ item }}
+  with_items:
+    - libunwind
+    - gperftools
+    - cetus
+
+- name: Cetus Install - install libunwind which tcmalloc depend
+  shell: sh  autogen.sh && ./configure --prefix=/usr/local && make && make install
+  args:
+    chdir: /tmp/libunwind
+
+- name: Cetus Install - install gperftools which tcmalloc depend
+  shell: sh  autogen.sh && ./configure --prefix=/usr/local && make && make install
+  args:
+    chdir: /tmp/gperftools
+
+- name: Cetus Install - add /usr/local/lib to ld.so.conf
+  lineinfile:
+    dest: /etc/ld.so.conf
+    state: present
+    insertafter: EOF
+    line: /usr/local/lib
+
+- name: Cetus Install - enable ldconfig
+  shell: ldconfig
+
+- name: Cetus Install - compile cetus code
+  shell: cmake ../  -DCMAKE_INSTALL_PREFIX=/usr/local/cetus -DSIMPLE_PARSER=OFF && make && make install
+  args:
+    chdir: /tmp/cetus/build
+
+- name: Cetus Install - copy cetus_app.sql to /tmp/
+  template:
+    src: cetus_app.sql.j2
+    dest: /tmp/cetus_app.sql
+  when: "'mysql_master' in group_names"
+
+- name: Cetus Install - get root password from file
+  shell: "cat ./credentials/{{ groups['mysql_master'][0] }}/root/password"
+  delegate_facts: True
+  delegate_to: localhost
+  run_once: true
+  register: root_password
+
+- name: Cetus Install - Import file.sql similar to mysql -u <username> -p <password> < hostname.sql
+  mysql_db:
+    login_user: root
+    login_password: "{{ root_password.stdout }}"
+    login_unix_socket: "{{ mysql_tmp_dir }}/mysql.sock"
+    state: import
+    name: all
+    target: /tmp/cetus_app.sql
+  when: "'mysql_master' in group_names"
+
+- name: Cetus Install - create cetus_mon user on master
+  mysql_user:
+    check_implicit_admin: yes
+    login_user: root
+    login_password: "{{ root_password.stdout }}"
+    login_unix_socket: "{{ mysql_tmp_dir }}/mysql.sock"
+    name: cetus_mon
+    host: "{{ item }}"
+    password: "{{ lookup('password', 'credentials/' + ansible_default_ipv4.address + '/cetus_mon/' + 'password chars=ascii_letters,digits,hexdigits') }}"
+    priv: "proxy_heart_beat.*:all"
+    state: present
+    config_file: no
+  when: "'mysql_master' in group_names"
+  with_items:
+    - "{{ groups['mysql_servers'] }}"
+
+- name: Cetus Install - get cetus_mon password from file
+  shell: "cat ./credentials/{{ groups['mysql_master'][0] }}/cetus_mon/password"
+  delegate_facts: True
+  delegate_to: localhost
+  run_once: true
+  register: cetus_mon_password
+
+- name: Cetus Install - combine
+  set_fact: host_list="{% for item in groups['mysql_slave'] %}{{ item }}:{{ mysql_port }} {% endfor %}"
+
+- name: Cetus Install - define proxy-read-only-backend-addresses list
+  set_fact: proxy_readonly_backend_addresses={{ host_list.split() | join(',') }}
+
+- name: Cetus Install - create cetus admin password to file
+  set_fact: cetus_password="{{ lookup('password', 'credentials/' + ansible_default_ipv4.address + '/cetus_admin/' + 'password chars=ascii_letters,digits,hexdigits') }}"
+  when: "'mysql_master' in group_names"
+
+- name: Cetus Install - get cetus admin password from file
+  shell: "cat ./credentials/{{ groups['mysql_master'][0] }}/cetus_admin/password"
+  delegate_facts: True
+  delegate_to: localhost
+  run_once: true
+  register: cetus_password
+
+- name: Cetus Install - create cetus config file
+  template: src=proxy.conf.j2 dest=/usr/local/cetus/conf/proxy.conf mode=0600 backup=yes
+
+- name: Cetus Install - create cetus user config file
+  template: src=users.json.j2 dest=/usr/local/cetus/conf/users.json mode=0600 backup=yes
+
+- name: Cetus Install - clean tmp files
+  file:
+    path: /tmp/{{ item }}
+    state: absent
+  with_items:
+    - libunwind
+    - gperftools
+    - cetus
